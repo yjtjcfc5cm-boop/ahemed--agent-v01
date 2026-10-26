@@ -4,15 +4,18 @@ import path from "node:path";
 import multipart from "@fastify/multipart";
 import Fastify, { type FastifyInstance } from "fastify";
 import {
+  ACCEPTED_REQUEST_VERSIONS,
   CONTRACT_VERSION,
+  FINAL_STATUSES,
   type AgentRequest,
   type ApprovalDecision,
   type Attachment,
+  type TaskEvent,
 } from "@ahmed/contract";
-import { Agent, APPROVAL_TTL_MS } from "./agent.js";
+import { Agent, APPROVAL_TTL_MS, type TokenPricing } from "./agent.js";
 import { openDb } from "./db.js";
 import type { ModelClient } from "./model.js";
-import { conversationResponse, errorResponse, taskResponse } from "./responses.js";
+import { conversationResponse, errorResponse, taskEvent, taskEventsResponse, taskResponse } from "./responses.js";
 import { Store, type Clock } from "./store.js";
 import { Workspace } from "./workspace.js";
 
@@ -25,6 +28,8 @@ export interface CoreOptions {
   model: ModelClient;
   clock?: Clock;
   approvalTtlMs?: number;
+  /** v0.2: USD per 1M tokens. Without both values, cost_usd stays null — never guessed. */
+  pricing?: TokenPricing;
   logger?: boolean;
 }
 
@@ -43,7 +48,7 @@ export async function createCore(opts: CoreOptions): Promise<Core> {
   const db = openDb(opts.dbFile);
   const store = new Store(db, opts.clock ?? (() => new Date()));
   const workspace = new Workspace(opts.workspaceRoot);
-  const agent = new Agent(store, workspace, opts.model, opts.approvalTtlMs ?? APPROVAL_TTL_MS);
+  const agent = new Agent(store, workspace, opts.model, opts.approvalTtlMs ?? APPROVAL_TTL_MS, opts.pricing ?? {});
   agent.recover();
 
   const inFlight = new Set<Promise<void>>();
@@ -188,6 +193,69 @@ export async function createCore(opts: CoreOptions): Promise<Core> {
     },
   );
 
+  // ---- GET /v1/tasks/:taskId/events (v0.2) ----
+  // Default: JSON snapshot of the task's event stream (the audit trail for this task).
+  // Accept: text/event-stream -> the snapshot, then live events until a final status.
+  app.get<{ Params: { taskId: string } }>("/v1/tasks/:taskId/events", async (req, reply) => {
+    agent.expireStale();
+    const task = store.getTask(req.params.taskId);
+    if (!task) return reply.code(404).send(errorResponse("NOT_FOUND", "Task not found."));
+
+    if (!(req.headers.accept ?? "").includes("text/event-stream")) {
+      return taskEventsResponse(task.id, store.listAudit(task.id));
+    }
+
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    });
+    const send = (e: TaskEvent) => reply.raw.write(`event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`);
+    for (const row of store.listAudit(task.id)) send(taskEvent(row));
+    if (FINAL_STATUSES.includes(task.status)) {
+      reply.raw.end();
+      return;
+    }
+    const off = store.onEvent((e) => {
+      if (e.task_id !== task.id) return;
+      send(e);
+      const current = store.getTask(task.id);
+      if (current && FINAL_STATUSES.includes(current.status)) {
+        off();
+        reply.raw.end();
+      }
+    });
+    req.raw.on("close", off);
+  });
+
+  // ---- POST /v1/tasks/:taskId/interrupt (v0.2) ----
+  app.post<{ Params: { taskId: string } }>("/v1/tasks/:taskId/interrupt", async (req, reply) => {
+    const outcome = agent.interrupt(req.params.taskId);
+    switch (outcome.kind) {
+      case "not_found":
+        return reply.code(404).send(errorResponse("NOT_FOUND", "Task not found."));
+      case "already_final":
+        return reply.code(409).send(
+          errorResponse("CONFLICT", "Task is already finished; nothing to interrupt.", {
+            request_id: outcome.task.request_id,
+            task_id: outcome.task.id,
+            status: outcome.task.status,
+          }),
+        );
+      case "locked":
+        return reply.code(409).send(
+          errorResponse("CONFLICT", "A write is already executing and is never killed mid-write.", {
+            request_id: outcome.task.request_id,
+            task_id: outcome.task.id,
+            status: outcome.task.status,
+          }),
+        );
+      case "ok":
+        return taskResponse(store, outcome.task);
+    }
+  });
+
   // ---- GET /v1/conversations/:conversationId ----
   app.get<{ Params: { conversationId: string } }>("/v1/conversations/:conversationId", async (req) => {
     agent.expireStale();
@@ -225,7 +293,12 @@ function parseRequest(raw: string | undefined): AgentRequest | string {
     return "'payload' is not valid JSON.";
   }
   if (p === null || typeof p !== "object") return "'payload' must be an object.";
-  if (p.contract_version !== CONTRACT_VERSION) return `contract_version must be "${CONTRACT_VERSION}".`;
+  if (
+    p.contract_version !== CONTRACT_VERSION &&
+    !(ACCEPTED_REQUEST_VERSIONS as readonly string[]).includes(String(p.contract_version))
+  ) {
+    return `contract_version must be "${CONTRACT_VERSION}".`;
+  }
   for (const k of ["request_id", "conversation_id"] as const) {
     if (typeof p[k] !== "string" || !(p[k] as string).trim() || (p[k] as string).length > 100) {
       return `'${k}' must be a non-empty string.`;
