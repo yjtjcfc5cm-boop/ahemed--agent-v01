@@ -1,6 +1,7 @@
 # V0_CONTRACT — AHMED App <-> Core API
 
-Contract version: `"0.1"`.
+Contract version: `"0.2"`. The Core still accepts `"0.1"` requests unchanged; every response
+carries `"0.2"`. v0.2 additions are marked below and live in §6.
 This file is the single source of truth for the contract. `packages/contract/src/index.ts`
 mirrors it field-for-field; both the Core and the mobile app import those types.
 
@@ -136,3 +137,56 @@ No connection is held open waiting for the user.
 
 `UNAUTHORIZED`, `BAD_REQUEST`, `NOT_FOUND`, `CONFLICT`, `APPROVAL_EXPIRED`, `UNSUPPORTED_FILE_TYPE`,
 `PATH_OUTSIDE_WORKSPACE`, `TOOL_ERROR`, `EXECUTION_FAILED`, `MODEL_ERROR`, `INTERRUPTED`, `INTERNAL`.
+
+---
+
+## 6. v0.2 additions
+
+Additive only. Nothing in §1–§5 changed; `"0.1"` requests keep working.
+
+### 6.1 `ApprovalRequest.plan` (optional)
+
+`PlanStep[]`: `{ n: number, label: string, tool?: string, risk_level?: RiskLevel }` — what happens,
+in order, if this approval is granted. For the v0.1 write pipeline: approve → execute → verify on disk.
+
+### 6.2 `ResultData.simulated` and `ResultData.cost_usd`
+
+| field | type | meaning |
+|---|---|---|
+| `simulated` | boolean | `false` = the reported change really happened. `true` = preview/simulation only. No simulated execution path exists today; any future one MUST set `true`. UI renders REAL on `false`, DEMO on `true`. |
+| `cost_usd` | number | USD cost of model tokens for this task. Present only when the Core is configured with both `MODEL_PRICE_INPUT_PER_1M` and `MODEL_PRICE_OUTPUT_PER_1M`; absent otherwise — never estimated. |
+
+Token counts are also recorded per task (`input_tokens`, `output_tokens` in the tasks table) and per
+model turn inside `MODEL_RESPONDED` event `detail.usage`, regardless of pricing.
+
+### 6.3 Task event stream — `GET /v1/tasks/{task_id}/events`
+
+The task-scoped view of the append-only audit trail.
+
+- Default (`Accept: application/json`): `200` `TaskEventsResponse` =
+  `{ contract_version, task_id, events: TaskEvent[] }`, oldest first.
+- `Accept: text/event-stream`: the full snapshot, then live events as SSE frames
+  (`event: <type>` + `data: <TaskEvent JSON>`), until the task reaches a final status
+  (`COMPLETED` / `FAILED` / `REJECTED`), then the stream closes. Already-final tasks get the
+  snapshot and an immediate close.
+
+`TaskEvent`: `{ seq: number, ts: string, type: string, task_id: string|null, action_id: string|null, detail: unknown }`.
+`type` is the audit event name (`STATUS_CHANGED`, `MODEL_RESPONDED`, `TOOL_CALLED`, `TOOL_RESULT`,
+`APPROVAL_REQUESTED`, `DECISION_RECORDED`, `EXECUTION_STARTED`, `EXECUTION_FINISHED`, `EXECUTION_ERROR`,
+`VERIFICATION`, `TASK_COMPLETED`, `TASK_FAILED`, `TASK_INTERRUPTED`, `INTERRUPT_REQUESTED`, `INTERRUPT_IGNORED`, …).
+
+Unknown task → `404`.
+
+### 6.4 Interrupt — `POST /v1/tasks/{task_id}/interrupt`
+
+No body. Ahmed stops a task. Honored only where stopping is safe by construction:
+
+| task status | result |
+|---|---|
+| `RECEIVED` | task ends `FAILED`, `error.code = INTERRUPTED` |
+| `PROCESSING` | flag set; the model loop fails the task `INTERRUPTED` between steps |
+| `WAITING_FOR_APPROVAL` | pending action closed as `REJECT`, task ends `REJECTED` with `error.code = INTERRUPTED`; nothing executes |
+| `APPROVED` / `EXECUTING` / `VERIFYING` | `409 CONFLICT` — a write in flight is never killed mid-write (same rule as restart recovery) |
+| final (`COMPLETED`/`FAILED`/`REJECTED`) | `409 CONFLICT` — nothing to interrupt |
+
+Unknown task → `404`. A late decision after an interrupt follows the normal conflict rules (§3).
