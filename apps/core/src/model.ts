@@ -33,11 +33,18 @@ export interface ModelToolCall {
   input: unknown;
 }
 
+export interface ModelUsage {
+  input_tokens: number;
+  output_tokens: number;
+}
+
 export interface ModelTurn {
   text: string;
   toolCalls: ModelToolCall[];
   /** The assistant message to append to the history before sending tool results back. */
   assistant: ModelMessage;
+  /** Token usage for this turn, when the provider reports it (v0.2 cost accounting). */
+  usage?: ModelUsage;
 }
 
 export interface ModelClient {
@@ -107,6 +114,7 @@ export class AnthropicModelClient implements ModelClient {
         ],
         raw: res.content,
       },
+      usage: { input_tokens: res.usage.input_tokens, output_tokens: res.usage.output_tokens },
     };
   }
 }
@@ -123,17 +131,18 @@ function toParam(m: ModelMessage): Anthropic.MessageParam {
 export interface FakeTurn {
   text?: string;
   toolCalls?: { name: string; input: unknown }[];
+  usage?: ModelUsage;
 }
 
 /** Deterministic model for tests: a handler decides each turn and every request is recorded. */
 export class FakeModelClient implements ModelClient {
   readonly requests: ModelRequest[] = [];
 
-  constructor(private readonly handler: (req: ModelRequest, call: number) => FakeTurn) {}
+  constructor(private readonly handler: (req: ModelRequest, call: number) => FakeTurn | Promise<FakeTurn>) {}
 
   async complete(req: ModelRequest): Promise<ModelTurn> {
     this.requests.push(structuredClone(req));
-    const turn = this.handler(req, this.requests.length - 1);
+    const turn = await this.handler(req, this.requests.length - 1);
     const toolCalls = (turn.toolCalls ?? []).map((c) => ({ id: `toolu_${randomUUID()}`, ...c }));
     const text = turn.text ?? "";
     return {
@@ -146,6 +155,7 @@ export class FakeModelClient implements ModelClient {
           ...toolCalls.map((c) => ({ type: "tool_use" as const, ...c })),
         ],
       },
+      usage: turn.usage,
     };
   }
 }

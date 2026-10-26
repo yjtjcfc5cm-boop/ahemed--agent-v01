@@ -80,11 +80,24 @@ CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log
 BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
 `;
 
+/**
+ * v0.2 columns, added to existing databases in place. CREATE TABLE IF NOT EXISTS only
+ * helps fresh files, so older files get the same columns through guarded ALTERs.
+ */
+function ensureColumn(db: DB, table: string, column: string, ddl: string): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (!cols.some((c) => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+}
+
 export function openDb(file: string): DB {
   const db = new Database(file);
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
   db.pragma("busy_timeout = 5000");
   db.exec(SCHEMA);
+  // v0.2: per-task model usage and cost (null until measured/priced).
+  ensureColumn(db, "tasks", "input_tokens", "input_tokens INTEGER");
+  ensureColumn(db, "tasks", "output_tokens", "output_tokens INTEGER");
+  ensureColumn(db, "tasks", "cost_usd", "cost_usd REAL");
   return db;
 }

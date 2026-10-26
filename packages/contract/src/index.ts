@@ -1,7 +1,13 @@
 // Mirrors V0_CONTRACT.md field-for-field. Change both together.
 
-export const CONTRACT_VERSION = "0.1" as const;
+export const CONTRACT_VERSION = "0.2" as const;
 export type ContractVersion = typeof CONTRACT_VERSION;
+
+/**
+ * Request versions the Core still accepts. v0.1 clients keep working unchanged;
+ * every response carries the Core's own CONTRACT_VERSION ("0.2").
+ */
+export const ACCEPTED_REQUEST_VERSIONS = ["0.1", "0.2"] as const;
 
 export type InputType = "text" | "file";
 
@@ -68,6 +74,14 @@ export interface AgentError {
   message: string;
 }
 
+/** One ordered step of what will happen if an approval is granted (v0.2). */
+export interface PlanStep {
+  n: number;
+  label: string;
+  tool?: string;
+  risk_level?: RiskLevel;
+}
+
 export interface ApprovalRequest {
   action_id: string;
   idempotency_key: string;
@@ -78,6 +92,8 @@ export interface ApprovalRequest {
   destination: string | null;
   risk_level: RiskLevel;
   expires_at: string;
+  /** v0.2: the plan this approval unlocks, in execution order. */
+  plan?: PlanStep[];
 }
 
 export type DecisionValue = "APPROVE" | "REJECT";
@@ -89,6 +105,14 @@ export interface ResultData {
   destination?: string;
   decision?: DecisionValue | "EXPIRED";
   verified?: boolean;
+  /**
+   * v0.2 — honesty flag. false: the reported change really happened (verified by the Core).
+   * true: preview/simulation only. No simulated execution paths exist yet; any future one
+   * MUST set this to true. The UI renders REAL on false and DEMO on true.
+   */
+  simulated?: boolean;
+  /** v0.2: USD cost of model tokens for this task; present only when pricing is configured. */
+  cost_usd?: number;
 }
 
 export interface TaskStatusData {
@@ -135,4 +159,28 @@ export interface ConversationResponse {
   conversation_id: string;
   messages: ConversationMessage[];
   tasks: ConversationTask[];
+}
+
+// ---------- v0.2: task event stream ----------
+
+/**
+ * One entry of a task's event stream. The stream is the task-scoped view of the
+ * append-only audit trail — the same rows, exposed live. `type` is the audit event
+ * name (e.g. STATUS_CHANGED, MODEL_RESPONDED, TOOL_CALLED, APPROVAL_REQUESTED,
+ * DECISION_RECORDED, EXECUTION_STARTED, EXECUTION_FINISHED, EXECUTION_ERROR,
+ * VERIFICATION, TASK_COMPLETED, TASK_FAILED, TASK_INTERRUPTED, INTERRUPT_IGNORED).
+ */
+export interface TaskEvent {
+  seq: number;
+  ts: string;
+  type: string;
+  task_id: string | null;
+  action_id: string | null;
+  detail: unknown;
+}
+
+export interface TaskEventsResponse {
+  contract_version: ContractVersion;
+  task_id: string;
+  events: TaskEvent[];
 }

@@ -24,11 +24,16 @@ const host = process.env.HOST ?? "0.0.0.0";
 const workspaceRoot = path.resolve(process.env.WORKSPACE_ROOT ?? "./workspace");
 const dbFile = path.resolve(process.env.DB_FILE ?? "./ahmed-core.db");
 
+// v0.2: cost accounting. Without BOTH prices the Core records tokens only and reports no cost.
+const priceIn = process.env.MODEL_PRICE_INPUT_PER_1M ? Number(process.env.MODEL_PRICE_INPUT_PER_1M) : undefined;
+const priceOut = process.env.MODEL_PRICE_OUTPUT_PER_1M ? Number(process.env.MODEL_PRICE_OUTPUT_PER_1M) : undefined;
+
 const core = await createCore({
   dbFile,
   workspaceRoot,
   appToken,
   model: new AnthropicModelClient(apiKey, modelName),
+  pricing: { inputPer1M: priceIn, outputPer1M: priceOut },
   logger: true,
 });
 
