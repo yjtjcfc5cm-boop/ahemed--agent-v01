@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import type { Attachment, DecisionValue, ErrorCode, RiskLevel, TaskStatus } from "@ahmed/contract";
+import { EventEmitter } from "node:events";
+import type { Attachment, DecisionValue, ErrorCode, RiskLevel, TaskEvent, TaskStatus } from "@ahmed/contract";
 import type { DB } from "./db.js";
 import { assertTransition } from "./stateMachine.js";
 
@@ -16,6 +17,9 @@ export interface TaskRow {
   error_code: ErrorCode | null;
   error_message: string | null;
   attachments: string;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cost_usd: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -70,6 +74,9 @@ export interface TaskPatch {
   result_message?: string | null;
   error_code?: ErrorCode | null;
   error_message?: string | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cost_usd?: number | null;
 }
 
 export class ConcurrentTransitionError extends Error {
@@ -81,6 +88,8 @@ export class ConcurrentTransitionError extends Error {
 
 /** All persistence goes through here. State lives in SQLite, never in memory. */
 export class Store {
+  private readonly emitter = new EventEmitter();
+
   constructor(
     readonly db: DB,
     readonly clock: Clock,
@@ -95,9 +104,27 @@ export class Store {
   }
 
   audit(event: string, ref: { taskId?: string | null; actionId?: string | null } = {}, detail?: unknown): void {
-    this.db
+    const ts = this.now();
+    const detailJson = detail === undefined ? null : JSON.stringify(detail);
+    const res = this.db
       .prepare("INSERT INTO audit_log (ts, event, task_id, action_id, detail) VALUES (?, ?, ?, ?, ?)")
-      .run(this.now(), event, ref.taskId ?? null, ref.actionId ?? null, detail === undefined ? null : JSON.stringify(detail));
+      .run(ts, event, ref.taskId ?? null, ref.actionId ?? null, detailJson);
+    // The audit trail IS the task event stream (v0.2): every insert is emitted live.
+    const emitted: TaskEvent = {
+      seq: Number(res.lastInsertRowid),
+      ts,
+      type: event,
+      task_id: ref.taskId ?? null,
+      action_id: ref.actionId ?? null,
+      detail: detailJson === null ? null : JSON.parse(detailJson),
+    };
+    this.emitter.emit("audit", emitted);
+  }
+
+  /** Subscribe to live audit events. Returns an unsubscribe function. */
+  onEvent(fn: (e: TaskEvent) => void): () => void {
+    this.emitter.on("audit", fn);
+    return () => this.emitter.off("audit", fn);
   }
 
   listAudit(taskId?: string): AuditRow[] {

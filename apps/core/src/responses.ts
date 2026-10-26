@@ -6,9 +6,12 @@ import {
   type Attachment,
   type ConversationResponse,
   type ErrorCode,
+  type PlanStep,
   type ResultData,
+  type TaskEvent,
+  type TaskEventsResponse,
 } from "@ahmed/contract";
-import type { ActionRow, Store, TaskRow } from "./store.js";
+import type { ActionRow, AuditRow, Store, TaskRow } from "./store.js";
 
 export function errorResponse(code: ErrorCode, message: string, extra: Partial<AgentResponse> = {}): AgentResponse {
   return {
@@ -24,6 +27,15 @@ export function errorResponse(code: ErrorCode, message: string, extra: Partial<A
   };
 }
 
+/** v0.2: the plan an approval unlocks — the real v0.1 write pipeline, in order. */
+function planFor(a: ActionRow): PlanStep[] {
+  return [
+    { n: 1, label: "Ahmed approves this change", tool: a.tool, risk_level: a.risk_level },
+    { n: 2, label: `Core executes ${a.operation} inside the workspace`, tool: a.tool, risk_level: a.risk_level },
+    { n: 3, label: "Core verifies the result on disk and reports what really happened" },
+  ];
+}
+
 export function approvalData(a: ActionRow): ApprovalRequest {
   return {
     action_id: a.id,
@@ -35,10 +47,13 @@ export function approvalData(a: ActionRow): ApprovalRequest {
     destination: a.destination,
     risk_level: a.risk_level,
     expires_at: a.expires_at,
+    plan: planFor(a),
   };
 }
 
 function resultData(task: TaskRow, a: ActionRow | undefined): ResultData | null {
+  // v0.2: simulated is always explicit. No simulated execution path exists today, so false.
+  const honesty = { simulated: false as const, ...(task.cost_usd !== null ? { cost_usd: task.cost_usd } : {}) };
   if (a) {
     return {
       action_id: a.id,
@@ -47,9 +62,10 @@ function resultData(task: TaskRow, a: ActionRow | undefined): ResultData | null 
       destination: a.destination ?? undefined,
       decision: a.decision ?? undefined,
       verified: a.verified === null ? undefined : a.verified === 1,
+      ...honesty,
     };
   }
-  return task.used_tool ? { tool: task.used_tool } : null;
+  return task.used_tool ? { tool: task.used_tool, ...honesty } : null;
 }
 
 /** Builds the contract response for a task purely from what is stored in SQLite. */
@@ -82,6 +98,23 @@ export function taskResponse(store: Store, task: TaskRow): AgentResponse {
       return { ...base, response_type: "TASK_STATUS", data: attachments.length ? { attachments } : null };
     }
   }
+}
+
+// ---------- v0.2: task event stream ----------
+
+export function taskEvent(a: AuditRow): TaskEvent {
+  return {
+    seq: a.id,
+    ts: a.ts,
+    type: a.event,
+    task_id: a.task_id,
+    action_id: a.action_id,
+    detail: a.detail ? JSON.parse(a.detail) : null,
+  };
+}
+
+export function taskEventsResponse(taskId: string, rows: AuditRow[]): TaskEventsResponse {
+  return { contract_version: CONTRACT_VERSION, task_id: taskId, events: rows.map(taskEvent) };
 }
 
 export function conversationResponse(store: Store, conversationId: string): ConversationResponse {
