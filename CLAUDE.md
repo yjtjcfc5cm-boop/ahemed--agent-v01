@@ -73,6 +73,6 @@ For NEXUS work, read [the authoritative current plan](docs/NEXUS_SCENE_FIRST_PLA
 - تشغيل التطبيق: `npm run mobile` ثم امسح رمز QR بتطبيق Expo Go (الجوال على نفس الشبكة). بعد تعديل .env أعد تشغيل Expo.
 - الاختبارات: `npm test` (Vitest مع FakeModelClient، بدون مفتاح أو شبكة)
 - فحص الأنواع: `npm run typecheck` (contract + core)، و`npm run typecheck -w @ahmed/mobile`
-- تحقق إصلاح 20 أكتوبر 2026: نجح 53 اختبارًا، وفحص الأنواع للـcontract والـCore والتطبيق. التفاصيل في القسم 8 من `docs/REPORT.md`.
+- تحقق إصلاح 20 أكتوبر 2026: نجح 53 اختبارًا، وفحص الأنواع للـcontract والـCore والتطبيق. التفاصيل في القسم 8 من `docs/REPORT.md`. يوم 21 أكتوبر حذف كومت آلي 30 من هذه الاختبارات وأضاف اختبارًا غير صالح؛ أُعيدت في 22 أكتوبر (54 اختبارًا)، وصار `.github/workflows/ci.yml` يشغّل `npm test` وفحص الأنواع على كل push وpull request.
 - عند التحديث لهذا الإصلاح: طلبات النقل القديمة التي لا تحتوي بصمة محتوى لا تُنفذ تلقائيًا ولا تُعلّم كمتحقق منها بعد الاستعادة. أعد إرسال طلب النقل عند الحاجة؛ لا يلزم حذف قاعدة البيانات أو المحادثات.
 - أول تشغيل للـCore قد يُظهر نافذة Windows Firewall: اسمح لـNode على الشبكات الخاصة (Private) حتى يصل الجوال.

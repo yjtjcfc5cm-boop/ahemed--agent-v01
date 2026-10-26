@@ -1,0 +1,23 @@
+name: CI
+
+# Runs the Core test suite and the type checks on every push and pull request.
+# Keep this green: a red main is how 30 integration tests went missing on 2026-10-21.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run typecheck -w @ahmed/mobile
