@@ -1,5 +1,5 @@
-import type { Attachment, DecisionValue, ErrorCode } from "@ahmed/contract";
-import { ModelError, type ModelBlock, type ModelClient, type ModelMessage } from "./model.js";
+import { FINAL_STATUSES, type Attachment, type DecisionValue, type ErrorCode } from "@ahmed/contract";
+import { ModelError, type ModelBlock, type ModelClient, type ModelMessage, type ModelUsage } from "./model.js";
 import type { ActionRow, Store, TaskRow } from "./store.js";
 import { TOOL_REGISTRY, executeMove, getTool, planMove, readFileTool, verifyMove, type MovePlan } from "./tools.js";
 import { ToolError, type Workspace } from "./workspace.js";
@@ -29,17 +29,39 @@ export type DecisionOutcome =
   | { kind: "conflict"; task: TaskRow; recorded: string }
   | { kind: "expired"; task: TaskRow };
 
+export type InterruptOutcome =
+  | { kind: "ok"; task: TaskRow }
+  | { kind: "not_found" }
+  | { kind: "already_final"; task: TaskRow }
+  | { kind: "locked"; task: TaskRow };
+
+/** USD prices per 1M tokens. Without both values no cost is computed — never a guess. */
+export interface TokenPricing {
+  inputPer1M?: number;
+  outputPer1M?: number;
+}
+
 /**
  * The Agent Core: owns decisions, state transitions, permissions and audit.
  * Every state change goes through Store.transition (explicit state machine, persisted in SQLite).
  */
 export class Agent {
+  /** Tasks Ahmed asked to stop while a model call is in flight; honored between steps. */
+  private readonly interruptionRequested = new Set<string>();
+
   constructor(
     private readonly store: Store,
     private readonly ws: Workspace,
     private readonly model: ModelClient,
     private readonly approvalTtlMs: number = APPROVAL_TTL_MS,
+    private readonly pricing: TokenPricing = {},
   ) {}
+
+  private costOf(usage: { in: number; out: number } | null): number | null {
+    if (!usage || this.pricing.inputPer1M === undefined || this.pricing.outputPer1M === undefined) return null;
+    const usd = (usage.in / 1e6) * this.pricing.inputPer1M + (usage.out / 1e6) * this.pricing.outputPer1M;
+    return Math.round(usd * 1e6) / 1e6;
+  }
 
   // ================= processing a new message =================
 
@@ -64,13 +86,31 @@ export class Agent {
       input_schema: t.inputSchema,
     }));
     let usedTool: string | null = null;
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let sawUsage = false;
+    const usage = (): { in: number; out: number } | null => (sawUsage ? { in: inputTokens, out: outputTokens } : null);
 
     for (let step = 0; step < MAX_MODEL_STEPS; step++) {
       const turn = await this.model.complete({ system: SYSTEM_PROMPT, messages, tools });
-      this.store.audit("MODEL_RESPONDED", { taskId: task.id }, { tool_calls: turn.toolCalls.map((c) => c.name) });
+      if (turn.usage) {
+        sawUsage = true;
+        inputTokens += turn.usage.input_tokens;
+        outputTokens += turn.usage.output_tokens;
+      }
+      this.store.audit("MODEL_RESPONDED", { taskId: task.id }, {
+        tool_calls: turn.toolCalls.map((c) => c.name),
+        ...(turn.usage ? { usage: turn.usage } : {}),
+      });
+
+      // An interrupt lands here, between steps — never in the middle of a write.
+      if (this.interruptionRequested.delete(task.id)) {
+        this.fail(task.id, "INTERRUPTED", "Interrupted by Ahmed.", usage());
+        return;
+      }
 
       if (turn.toolCalls.length === 0) {
-        this.complete(task, turn.text || "(no answer)", usedTool);
+        this.complete(task, turn.text || "(no answer)", usedTool, usage());
         return;
       }
 
@@ -84,7 +124,7 @@ export class Agent {
           if (spec.risk === "write") {
             // The registry says this changes something: never run it here, ask Ahmed first.
             const plan = planMove(this.ws, call.input);
-            this.requestApproval(task, spec.name, plan, turn.text);
+            this.requestApproval(task, spec.name, plan, turn.text, usage());
             return;
           }
           const out = await readFileTool(this.ws, call.input);
@@ -103,7 +143,7 @@ export class Agent {
       }
       messages.push({ role: "user", content: results });
     }
-    this.fail(task.id, "MODEL_ERROR", "The agent did not finish within the step limit.");
+    this.fail(task.id, "MODEL_ERROR", "The agent did not finish within the step limit.", usage());
   }
 
   /** Conversation history up to and including this task's user message. */
@@ -127,15 +167,28 @@ export class Agent {
     return out;
   }
 
-  private complete(task: TaskRow, text: string, usedTool: string | null): void {
+  private complete(task: TaskRow, text: string, usedTool: string | null, usage: { in: number; out: number } | null): void {
     this.store.tx(() => {
-      this.store.transition(task.id, "COMPLETED", { result_message: text, used_tool: usedTool });
+      this.store.transition(task.id, "COMPLETED", {
+        result_message: text,
+        used_tool: usedTool,
+        ...(usage ? { input_tokens: usage.in, output_tokens: usage.out, cost_usd: this.costOf(usage) } : {}),
+      });
       this.store.addMessage({ conversationId: task.conversation_id, role: "assistant", content: text, taskId: task.id });
-      this.store.audit("TASK_COMPLETED", { taskId: task.id }, { used_tool: usedTool });
+      this.store.audit("TASK_COMPLETED", { taskId: task.id }, {
+        used_tool: usedTool,
+        ...(usage ? { usage, cost_usd: this.costOf(usage) } : {}),
+      });
     });
   }
 
-  private requestApproval(task: TaskRow, tool: string, plan: MovePlan, modelText: string): void {
+  private requestApproval(
+    task: TaskRow,
+    tool: string,
+    plan: MovePlan,
+    modelText: string,
+    usage: { in: number; out: number } | null,
+  ): void {
     const description = `Move file ${plan.source} to folder ${plan.destination_dir} (new path: ${plan.target}).`;
     const expiresAt = new Date(this.store.clock().getTime() + this.approvalTtlMs).toISOString();
     this.store.tx(() => {
@@ -150,7 +203,11 @@ export class Agent {
         input: JSON.stringify(plan),
         expires_at: expiresAt,
       });
-      this.store.transition(task.id, "WAITING_FOR_APPROVAL", { used_tool: tool, result_message: description });
+      this.store.transition(task.id, "WAITING_FOR_APPROVAL", {
+        used_tool: tool,
+        result_message: description,
+        ...(usage ? { input_tokens: usage.in, output_tokens: usage.out, cost_usd: this.costOf(usage) } : {}),
+      });
       this.store.audit("APPROVAL_REQUESTED", { taskId: task.id, actionId: action.id }, {
         idempotency_key: action.idempotency_key,
         plan,
@@ -165,9 +222,13 @@ export class Agent {
     });
   }
 
-  private fail(taskId: string, code: ErrorCode, message: string): void {
+  private fail(taskId: string, code: ErrorCode, message: string, usage: { in: number; out: number } | null = null): void {
     this.store.tx(() => {
-      const task = this.store.transition(taskId, "FAILED", { error_code: code, error_message: message });
+      const task = this.store.transition(taskId, "FAILED", {
+        error_code: code,
+        error_message: message,
+        ...(usage ? { input_tokens: usage.in, output_tokens: usage.out, cost_usd: this.costOf(usage) } : {}),
+      });
       this.store.addMessage({ conversationId: task.conversation_id, role: "assistant", content: `Error: ${message}`, taskId });
       this.store.audit("TASK_FAILED", { taskId }, { code, message });
     });
@@ -316,6 +377,55 @@ export class Agent {
         this.store.audit("TASK_FAILED", { taskId: task.id, actionId: action.id }, { code: "EXECUTION_FAILED", message });
       }
     });
+  }
+
+  // ================= interruption (v0.2) =================
+
+  /**
+   * Ahmed can stop a task. Honored where stopping is safe by construction:
+   *  - RECEIVED/PROCESSING: the model loop sees the flag between steps and fails INTERRUPTED.
+   *  - WAITING_FOR_APPROVAL: the pending action is closed and the task ends REJECTED, nothing executed.
+   *  - APPROVED/EXECUTING/VERIFYING: a write is in flight; it is never killed mid-write (same rule
+   *    as restart recovery) — reported "locked" so the caller can say so honestly.
+   */
+  interrupt(taskId: string): InterruptOutcome {
+    const task = this.store.getTask(taskId);
+    if (!task) return { kind: "not_found" };
+    if (FINAL_STATUSES.includes(task.status)) return { kind: "already_final", task };
+
+    if (task.status === "APPROVED" || task.status === "EXECUTING" || task.status === "VERIFYING") {
+      this.store.audit("INTERRUPT_IGNORED", { taskId }, { status: task.status });
+      return { kind: "locked", task };
+    }
+
+    if (task.status === "WAITING_FOR_APPROVAL") {
+      const action = this.store.getActionByTask(taskId);
+      this.store.tx(() => {
+        if (action && action.decision === null) this.store.recordDecision(action.id, "REJECT");
+        this.store.audit("TASK_INTERRUPTED", { taskId, actionId: action?.id }, { at: task.status });
+        const t = this.store.transition(taskId, "REJECTED", {
+          result_message: "Interrupted while waiting for approval. Nothing was changed.",
+          error_code: "INTERRUPTED",
+          error_message: "Interrupted by Ahmed before any execution.",
+        });
+        this.store.addMessage({
+          conversationId: t.conversation_id,
+          role: "assistant",
+          content: "Interrupted. Nothing was changed.",
+          taskId,
+        });
+      });
+      return { kind: "ok", task: this.store.getTask(taskId)! };
+    }
+
+    // RECEIVED or PROCESSING
+    this.store.audit("INTERRUPT_REQUESTED", { taskId }, { at: task.status });
+    if (task.status === "RECEIVED") {
+      this.fail(taskId, "INTERRUPTED", "Interrupted before processing started.");
+    } else {
+      this.interruptionRequested.add(taskId);
+    }
+    return { kind: "ok", task: this.store.getTask(taskId)! };
   }
 
   // ================= startup recovery =================
