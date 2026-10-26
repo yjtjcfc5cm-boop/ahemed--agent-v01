@@ -2,9 +2,9 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { AgentResponse, ApprovalRequest, ConversationResponse } from "@ahmed/contract";
+import { CONTRACT_VERSION, type AgentResponse, type ApprovalRequest, type ConversationResponse } from "@ahmed/contract";
 import { FakeModelClient, type FakeTurn, type ModelBlock, type ModelRequest } from "../src/model.js";
-import { createCore, type Core } from "../src/server.js";
+import { createCore, type Core, type CoreOptions } from "../src/server.js";
 
 export const TOKEN = "test-app-token";
 export const AUTH = { authorization: `Bearer ${TOKEN}` };
@@ -31,8 +31,8 @@ export function makeEnv(): Env {
   return env;
 }
 
-export function startCore(env: Env, model: FakeModelClient): Promise<Core> {
-  return createCore({ dbFile: env.dbFile, workspaceRoot: env.wsRoot, appToken: TOKEN, model, clock: env.clock });
+export function startCore(env: Env, model: FakeModelClient, extra: Partial<CoreOptions> = {}): Promise<Core> {
+  return createCore({ dbFile: env.dbFile, workspaceRoot: env.wsRoot, appToken: TOKEN, model, clock: env.clock, ...extra });
 }
 
 // ---------- scripted fake model ----------
@@ -109,7 +109,7 @@ export function multipart(payload: unknown, file?: UploadFile) {
 
 export function requestPayload(conversationId: string, message: string, file?: UploadFile, requestId: string = randomUUID()) {
   return {
-    contract_version: "0.1",
+    contract_version: CONTRACT_VERSION,
     request_id: requestId,
     conversation_id: conversationId,
     input_type: file ? "file" : "text",
